@@ -5,6 +5,13 @@
   - All knowledge lives in `~/.claude/memory.db` (FTS5). Never use LIKE.
 - 検索: `SELECT source_table, substr(text,1,150) FROM memory_fts WHERE memory_fts MATCH 'keyword' LIMIT 10`
   - Search: `SELECT source_table, substr(text,1,150) FROM memory_fts WHERE memory_fts MATCH 'keyword' LIMIT 10`
+- memory.dbスキーマ / memory.db schema:
+  - `memories`: id, project, category, title, content, keywords, created_at, updated_at
+  - `services`: id, port, app_name, hostname, directory, framework, status, notes, caddy_port, tags
+  - `rules`: id, scope, category, rule, severity, keywords, created_at, updated_at
+  - `sessions`: id, session_id, project_path, started_at, summary, key_actions, files_modified
+  - `memory_fts`: FTS5仮想テーブル (source_table, source_id, text) — 全テーブルを横断検索
+    - FTS5 virtual table (source_table, source_id, text) — cross-table full-text search
 - 新サービス作成時 → services INSERT必須。新ルール発見時 → rules INSERT + FTS再構築
   - When creating a new service → INSERT into services. When discovering a new rule → INSERT into rules + rebuild FTS.
 - DB情報(services, rules, memories)は変更即更新。古い情報は即座に修正せよ
