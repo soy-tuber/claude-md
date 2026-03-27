@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-infra_sync.py - systemd + cloudflared config + ss からインフラ状態を収集し infra.db に書き込む
+infra_sync.py - systemd + cloudflared config + Caddyfile + ss からインフラ状態を収集し infra.db に書き込む
 ================================================================================
 cron: 5:50 毎日 (morning_briefing 6:00 の直前)
 """
@@ -14,6 +14,7 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "infra.db"
 CONFIG_YML = Path("/etc/cloudflared/config.yml")
+CADDYFILE = Path("/home/soy/active/logger/Caddyfile")
 
 
 def init_db(conn: sqlite3.Connection):
@@ -22,30 +23,46 @@ def init_db(conn: sqlite3.Connection):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             port INTEGER,
             caddy_port INTEGER,
+            tunnel_port INTEGER,
             app_name TEXT NOT NULL,
             hostname TEXT,
             directory TEXT,
             framework TEXT,
             systemd_unit TEXT,
+            systemd_scope TEXT DEFAULT 'system',
             status TEXT DEFAULT 'unknown',
+            is_listening INTEGER DEFAULT 0,
             notes TEXT,
             updated_at TEXT
         )
     """)
+    # カラム追加（既存DBとの互換性）
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(services)").fetchall()}
+    migrations = {
+        "tunnel_port": "ALTER TABLE services ADD COLUMN tunnel_port INTEGER",
+        "is_listening": "ALTER TABLE services ADD COLUMN is_listening INTEGER DEFAULT 0",
+        "systemd_scope": "ALTER TABLE services ADD COLUMN systemd_scope TEXT DEFAULT 'system'",
+    }
+    for col, sql in migrations.items():
+        if col not in existing:
+            conn.execute(sql)
     conn.commit()
 
 
-def get_systemd_services() -> list[dict]:
-    """systemd の running サービスからアプリ情報を取得"""
-    result = subprocess.run(
-        ["systemctl", "list-units", "--type=service", "--state=running", "--no-pager", "--plain"],
-        capture_output=True, text=True,
-    )
-    # アプリ系 unit を抽出（system系は除外）
+def get_systemd_services(scope: str = "system") -> list[dict]:
+    """systemd サービスからアプリ情報を取得（system / user 両対応）"""
+    cmd = ["systemctl", "list-units", "--type=service", "--state=running", "--no-pager", "--plain"]
+    if scope == "user":
+        cmd.insert(1, "--user")
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
     skip = {
         "console-getty", "containerd", "cron", "dbus", "docker", "getty@tty1",
         "nginx", "polkit", "rsyslog", "snapd", "ssh", "tailscaled",
         "unattended-upgrades", "user@1000", "wsl-pro",
+        "at-spi-dbus-bus", "dbus", "pipewire", "pipewire-pulse", "wireplumber",
+        "xdg-document-portal", "xdg-desktop-portal", "xdg-desktop-portal-gtk",
     }
     units = []
     for line in result.stdout.splitlines():
@@ -59,11 +76,12 @@ def get_systemd_services() -> list[dict]:
 
     services = []
     for unit in units:
-        info = subprocess.run(
-            ["systemctl", "show", f"{unit}.service",
-             "--property=Description,WorkingDirectory,ActiveState,ExecStart"],
-            capture_output=True, text=True,
-        )
+        show_cmd = ["systemctl", "show", f"{unit}.service",
+                     "--property=Description,WorkingDirectory,ActiveState,ExecStart"]
+        if scope == "user":
+            show_cmd.insert(1, "--user")
+
+        info = subprocess.run(show_cmd, capture_output=True, text=True)
         props = {}
         for line in info.stdout.splitlines():
             if "=" in line:
@@ -80,7 +98,6 @@ def get_systemd_services() -> list[dict]:
         if m:
             port = int(m.group(1))
         if port is None:
-            # --port XXXX, --server.port XXXX, --bind/-b x.x.x.x:XXXX
             m = re.search(r"(?:--port|--server\.port)\s+(\d{4,5})", exec_start)
             if m:
                 port = int(m.group(1))
@@ -89,15 +106,19 @@ def get_systemd_services() -> list[dict]:
                 if m:
                     port = int(m.group(1))
 
-        # framework を Description から推定
+        # framework を Description / ExecStart から推定
         framework = None
+        haystack = f"{desc} {exec_start}".lower()
         for fw in ("Streamlit", "FastAPI", "Flask", "Gunicorn", "Caddy", "cloudflared"):
-            if fw.lower() in desc.lower():
+            if fw.lower() in haystack:
                 framework = fw
                 break
+        if not framework and "uvicorn" in haystack:
+            framework = "FastAPI"
 
         services.append({
             "systemd_unit": unit,
+            "systemd_scope": scope,
             "app_name": unit,
             "description": desc,
             "port": port,
@@ -128,35 +149,30 @@ def get_tunnel_routes() -> dict[int, str]:
 
 def get_listening_ports() -> set[int]:
     """ss -tlnp から LISTEN 中のポートを取得"""
-    result = subprocess.run(
-        ["ss", "-tlnp"],
-        capture_output=True, text=True,
-    )
+    result = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True)
     ports = set()
     for line in result.stdout.splitlines():
-        # 0.0.0.0:8505 or 127.0.0.1:8507 or [::]:8502
         for m in re.finditer(r":(\d{4,5})\s", line):
             ports.add(int(m.group(1)))
     return ports
 
 
-def get_caddy_ports() -> dict[int, int]:
-    """Caddy の 9xxx → 8xxx マッピングを推定 (9xxx = app_port + 1000)"""
-    result = subprocess.run(
-        ["ss", "-tlnp"],
-        capture_output=True, text=True,
-    )
-    caddy_ports = set()
-    for line in result.stdout.splitlines():
-        if "caddy" in line:
-            for m in re.finditer(r":(\d{4,5})\s", line):
-                caddy_ports.add(int(m.group(1)))
-
-    # 9531 → app_port 8531
+def get_caddy_map() -> dict[int, int]:
+    """Caddyfile をパースして app_port → caddy_port マッピングを取得"""
     mapping = {}
-    for cp in caddy_ports:
-        if 9500 <= cp <= 9599:
-            mapping[cp - 1000] = cp
+    if not CADDYFILE.exists():
+        return mapping
+
+    content = CADDYFILE.read_text()
+    # :9535 { ... reverse_proxy localhost:8535 ... }
+    for m in re.finditer(
+        r":(\d{4,5})\s*\{[^}]*reverse_proxy\s+localhost:(\d{4,5})",
+        content, re.DOTALL,
+    ):
+        caddy_port = int(m.group(1))
+        app_port = int(m.group(2))
+        mapping[app_port] = caddy_port
+
     return mapping
 
 
@@ -169,10 +185,11 @@ def sync():
     # 全削除して再構築（毎回最新スナップショット）
     conn.execute("DELETE FROM services")
 
-    systemd_svcs = get_systemd_services()
+    # system + user 両方のサービスを取得
+    systemd_svcs = get_systemd_services("system") + get_systemd_services("user")
     tunnel_routes = get_tunnel_routes()
     listening = get_listening_ports()
-    caddy_map = get_caddy_ports()
+    caddy_map = get_caddy_map()
 
     # systemd サービスを登録
     seen_ports = set()
@@ -182,50 +199,75 @@ def sync():
         # ポートが無い systemd サービスは tunnel routes から逆引き
         if port is None:
             for p, h in tunnel_routes.items():
-                # app_name が hostname に含まれるか確認
                 if svc["app_name"].replace("-", "") in h.replace("-", "").replace(".", ""):
                     port = p
                     break
 
-        hostname = tunnel_routes.get(port)
-        # caddy 経由のサービスは caddy_port の hostname を確認
+        # caddy 経由の場合
         caddy_port = caddy_map.get(port) if port else None
+
+        # hostname: アプリポート直接 or caddy_port 経由で tunnel に到達
+        hostname = tunnel_routes.get(port)
         if not hostname and caddy_port:
             hostname = tunnel_routes.get(caddy_port)
 
-        # ポートが無いインフラ系(caddy, cloudflared等)は systemd running なら active
+        # tunnel_port: Cloudflare Tunnel が実際に向いているポート
+        tunnel_port = None
+        if port and port in tunnel_routes:
+            tunnel_port = port
+        elif caddy_port and caddy_port in tunnel_routes:
+            tunnel_port = caddy_port
+
+        is_listening = 1 if (port and port in listening) else 0
+
         if port:
-            status = "active" if port in listening else "stopped"
+            status = "active" if is_listening else "stopped"
         else:
-            status = "active"
+            status = "active"  # インフラ系(caddy, cloudflared)
 
         conn.execute(
             """INSERT INTO services
-               (port, caddy_port, app_name, hostname, directory, framework, systemd_unit, status, notes, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (port, caddy_port, svc["app_name"], hostname, svc["directory"],
-             svc["framework"], svc["systemd_unit"], status, svc["description"], now),
+               (port, caddy_port, tunnel_port, app_name, hostname, directory,
+                framework, systemd_unit, systemd_scope, status, is_listening, notes, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (port, caddy_port, tunnel_port, svc["app_name"], hostname, svc["directory"],
+             svc["framework"], svc["systemd_unit"], svc["systemd_scope"],
+             status, is_listening, svc["description"], now),
         )
         if port:
             seen_ports.add(port)
 
     # tunnel routes にあるが systemd に無い = 手動起動 or 停止中
-    for port, hostname in tunnel_routes.items():
-        if port in seen_ports:
+    for tport, hostname in tunnel_routes.items():
+        # caddy 経由ポートで実体が既に登録済みならスキップ
+        if tport in caddy_map.values():
             continue
-        # caddy 経由ポートはスキップ (実体は別ポート)
-        if port in caddy_map.values():
+        # 直接ポートで既に登録済みならスキップ
+        if tport in seen_ports:
             continue
 
-        status = "active" if port in listening else "stopped"
-        app_name = hostname.split(".")[0] if hostname else f"port-{port}"
+        # tport が caddy_port の場合、実体の app_port を逆引き
+        app_port = None
+        for ap, cp in caddy_map.items():
+            if cp == tport:
+                app_port = ap
+                break
+        actual_port = app_port or tport
+
+        if actual_port in seen_ports:
+            continue
+
+        is_listening = 1 if actual_port in listening else 0
+        status = "active" if is_listening else "stopped"
+        app_name = hostname.split(".")[0] if hostname else f"port-{actual_port}"
 
         conn.execute(
             """INSERT INTO services
-               (port, caddy_port, app_name, hostname, directory, framework, systemd_unit, status, notes, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (port, caddy_map.get(port), app_name, hostname, None, None, None,
-             status, "config.yml記載・systemd未登録", now),
+               (port, caddy_port, tunnel_port, app_name, hostname, directory,
+                framework, systemd_unit, systemd_scope, status, is_listening, notes, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (actual_port, caddy_map.get(actual_port), tport, app_name, hostname,
+             None, None, None, None, status, is_listening, "config.yml記載・systemd未登録", now),
         )
 
     conn.commit()
@@ -233,9 +275,10 @@ def sync():
     count = conn.execute("SELECT COUNT(*) FROM services").fetchone()[0]
     active = conn.execute("SELECT COUNT(*) FROM services WHERE status='active'").fetchone()[0]
     stopped = conn.execute("SELECT COUNT(*) FROM services WHERE status='stopped'").fetchone()[0]
+    listening_count = conn.execute("SELECT COUNT(*) FROM services WHERE is_listening=1").fetchone()[0]
     conn.close()
 
-    print(f"[infra_sync] {now}: {count} services ({active} active, {stopped} stopped) → {DB_PATH}")
+    print(f"[infra_sync] {now}: {count} services ({active} active, {stopped} stopped, {listening_count} listening) → {DB_PATH}")
 
 
 if __name__ == "__main__":
